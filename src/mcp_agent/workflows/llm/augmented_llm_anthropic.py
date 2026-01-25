@@ -1,6 +1,6 @@
 import asyncio
 import functools
-from typing import Any, Iterable, List, Type, Union, cast
+from typing import Any, AsyncIterator, Iterable, List, Type, Union, cast
 
 from pydantic import BaseModel
 
@@ -69,6 +69,7 @@ from mcp_agent.workflows.llm.augmented_llm import (
     RequestParams,
     CallToolResult,
 )
+from mcp_agent.workflows.llm.streaming_events import StreamEvent, StreamEventType
 from mcp_agent.logging.logger import get_logger
 from mcp_agent.workflows.llm.multipart_converter_anthropic import AnthropicConverter
 
@@ -396,6 +397,353 @@ class AnthropicAugmentedLLM(AugmentedLLM[MessageParam, Message]):
                     span.set_attributes(response_data)
 
             return responses
+
+    @track_tokens()
+    async def generate_stream(
+        self,
+        message,
+        request_params: RequestParams | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """
+        Stream LLM generation events using Anthropic's native streaming API.
+
+        This method provides real-time updates during generation, including:
+        - Text deltas as they're generated
+        - Tool use events and execution
+        - Iteration boundaries
+        - Token usage per iteration
+        """
+        tracer = get_tracer(self.context)
+        with tracer.start_as_current_span(
+            f"{self.__class__.__name__}.{self.name}.generate_stream"
+        ) as span:
+            span.set_attribute(GEN_AI_AGENT_NAME, self.agent.name)
+            self._annotate_span_for_generation_message(span, message)
+
+            try:
+                config = self.context.config
+                messages: List[MessageParam] = []
+                params = self.get_request_params(request_params)
+
+                if self.context.tracing_enabled:
+                    AugmentedLLM.annotate_span_with_request_params(span, params)
+
+                if params.use_history:
+                    messages.extend(self.history.get())
+                messages.extend(
+                    AnthropicConverter.convert_mixed_messages_to_anthropic(message)
+                )
+
+                async def update_tools():
+                    list_tools_result = await self.agent.list_tools(
+                        tool_filter=params.tool_filter
+                    )
+                    available_tools: List[ToolParam] = [
+                        {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "input_schema": tool.inputSchema,
+                        }
+                        for tool in list_tools_result.tools
+                    ]
+                    return available_tools
+                available_tools = await update_tools()
+
+                responses: List[Message] = []
+                model = await self.select_model(params)
+
+                if model:
+                    span.set_attribute(GEN_AI_REQUEST_MODEL, model)
+
+                total_input_tokens = 0
+                total_output_tokens = 0
+                finish_reasons = []
+
+                # Get API configuration and create client once
+                api_key = config.anthropic.api_key if config.anthropic else None
+                base_url = config.anthropic.base_url if config.anthropic else None
+
+                if api_key:
+                    client = AsyncAnthropic(api_key=api_key, base_url=base_url)
+                else:
+                    client = AsyncAnthropic()
+
+                async with client:
+                    for i in range(params.max_iterations):
+                        # Yield iteration start event
+                        yield StreamEvent(
+                            type=StreamEventType.ITERATION_START,
+                            iteration=i,
+                            model=model,
+                            metadata={"messages_count": len(messages)},
+                        )
+
+                        # Final iteration validation (BEFORE API call)
+                        if (
+                            i == params.max_iterations - 1
+                            and responses
+                            and responses[-1].stop_reason == "tool_use"
+                        ):
+                            final_prompt_message = MessageParam(
+                                role="user",
+                                content="""We've reached the maximum number of iterations.
+                                Please stop using tools now and provide your final comprehensive answer based on all tool results so far.
+                                At the beginning of your response, clearly indicate that your answer may be incomplete due to reaching the maximum number of tool usage iterations,
+                                and explain what additional information you would have needed to provide a more complete answer.""",
+                            )
+                            messages.append(final_prompt_message)
+
+                        # Build API request arguments
+                        arguments = {
+                            "model": model,
+                            "max_tokens": params.maxTokens,
+                            "messages": messages,
+                            "stop_sequences": params.stopSequences or [],
+                            "tools": available_tools,
+                        }
+
+                        if system := (self.instruction or params.systemPrompt):
+                            arguments["system"] = system
+
+                        if params.metadata:
+                            arguments = {**arguments, **params.metadata}
+
+                        self.logger.debug(
+                            "Streaming request arguments:", data=arguments
+                        )
+                        self._log_chat_progress(
+                            chat_turn=(len(messages) + 1) // 2, model=model
+                        )
+
+                        # Use native streaming API
+                        # Both native Anthropic client and OpenTelemetry-wrapped client
+                        # return an async context manager from stream()
+                        response = None
+                        yielded_content = False
+
+                        try:
+                            stream_context = client.messages.stream(**arguments)
+
+                            # Single event processing loop
+                            async with stream_context as stream:
+                                # Stream events as they arrive
+                                async for event in stream:
+                                    # Handle text deltas
+                                    if event.type == "content_block_delta":
+                                        if hasattr(event.delta, "text"):
+                                            yielded_content = True
+                                            yield StreamEvent(
+                                                type=StreamEventType.TEXT_DELTA,
+                                                content=event.delta.text,
+                                                iteration=i,
+                                                model=model,
+                                            )
+                                        elif hasattr(event.delta, "thinking"):
+                                            yield StreamEvent(
+                                                type=StreamEventType.THINKING,
+                                                content=event.delta.thinking,
+                                                iteration=i,
+                                                model=model,
+                                            )
+
+                                    # Handle thinking blocks (extended thinking models)
+                                    elif event.type == "content_block_start":
+                                        if (
+                                            hasattr(event, "content_block")
+                                            and hasattr(event.content_block, "type")
+                                            and event.content_block.type == "thinking"
+                                        ):
+                                            if hasattr(event.content_block, "thinking"):
+                                                yield StreamEvent(
+                                                    type=StreamEventType.THINKING,
+                                                    content=event.content_block.thinking,
+                                                    iteration=i,
+                                                    model=model,
+                                                )
+
+                                # Get final message after stream completes
+                                response = await stream.get_final_message()
+
+                        except Exception as stream_error:
+                            # Only fall back if no content was yielded
+                            if yielded_content:
+                                # Re-raise to trigger ERROR event, don't duplicate content
+                                raise
+                            self.logger.warning(
+                                f"Streaming failed, falling back to create(): {stream_error}"
+                            )
+                            response = await client.messages.create(**arguments)
+
+                        self.logger.debug(f"{model} response:", data=response)
+                        self._annotate_span_for_completion_response(span, response, i)
+
+                        # Per-iteration token counts
+                        iteration_input = response.usage.input_tokens
+                        iteration_output = response.usage.output_tokens
+
+                        total_input_tokens += iteration_input
+                        total_output_tokens += iteration_output
+
+                        # Add response to history
+                        response_as_message = self.convert_message_to_message_param(
+                            response
+                        )
+                        messages.append(response_as_message)
+                        responses.append(response)
+                        finish_reasons.append(response.stop_reason)
+
+                        # Incremental token tracking
+                        if self.context.token_counter:
+                            await self.context.token_counter.record_usage(
+                                input_tokens=iteration_input,
+                                output_tokens=iteration_output,
+                                model_name=model,
+                                provider=self.provider,
+                            )
+
+                        # Yield iteration end event with usage
+                        yield StreamEvent(
+                            type=StreamEventType.ITERATION_END,
+                            iteration=i,
+                            model=model,
+                            stop_reason=response.stop_reason,
+                            usage={
+                                "input_tokens": iteration_input,
+                                "output_tokens": iteration_output,
+                            },
+                        )
+
+                        # Handle stop reasons
+                        if response.stop_reason == "end_turn":
+                            self.logger.debug(
+                                f"Iteration {i}: Stopping because finish_reason is 'end_turn'"
+                            )
+                            span.set_attribute(
+                                GEN_AI_RESPONSE_FINISH_REASONS, ["end_turn"]
+                            )
+                            break
+                        elif response.stop_reason == "stop_sequence":
+                            self.logger.debug(
+                                f"Iteration {i}: Stopping because finish_reason is 'stop_sequence'"
+                            )
+                            span.set_attribute(
+                                GEN_AI_RESPONSE_FINISH_REASONS, ["stop_sequence"]
+                            )
+                            break
+                        elif response.stop_reason == "max_tokens":
+                            self.logger.debug(
+                                f"Iteration {i}: Stopping because finish_reason is 'max_tokens'"
+                            )
+                            span.set_attribute(
+                                GEN_AI_RESPONSE_FINISH_REASONS, ["max_tokens"]
+                            )
+                            break
+                        else:  # response.stop_reason == "tool_use":
+                            # Process tool calls
+                            for content in response.content:
+                                if content.type == "tool_use":
+                                    tool_name = content.name
+                                    tool_args = content.input
+                                    tool_use_id = content.id
+
+                                    # Yield tool use start event
+                                    yield StreamEvent(
+                                        type=StreamEventType.TOOL_USE_START,
+                                        content={
+                                            "name": tool_name,
+                                            "input": tool_args,
+                                        },
+                                        iteration=i,
+                                        model=model,
+                                        metadata={"tool_id": tool_use_id},
+                                    )
+
+                                    # Execute tool
+                                    tool_call_request = CallToolRequest(
+                                        method="tools/call",
+                                        params=CallToolRequestParams(
+                                            name=tool_name, arguments=tool_args
+                                        ),
+                                    )
+
+                                    result = await self.call_tool(
+                                        request=tool_call_request,
+                                        tool_call_id=tool_use_id,
+                                    )
+
+                                    # Yield tool result event
+                                    yield StreamEvent(
+                                        type=StreamEventType.TOOL_RESULT,
+                                        content={
+                                            "result": str(result.content),
+                                            "is_error": result.isError,
+                                        },
+                                        iteration=i,
+                                        model=model,
+                                        metadata={"tool_id": tool_use_id},
+                                    )
+
+                                    # Add tool result to messages
+                                    tool_result_message = self.from_mcp_tool_result(
+                                        result, tool_use_id
+                                    )
+                                    messages.append(tool_result_message)
+
+                                    # Yield tool use end event
+                                    yield StreamEvent(
+                                        type=StreamEventType.TOOL_USE_END,
+                                        iteration=i,
+                                        model=model,
+                                        metadata={"tool_id": tool_use_id},
+                                    )
+
+                                    # Refresh tools to pick up any newly available tools enabled by previous execution
+                                    available_tools = await update_tools()
+
+                # Update history
+                if params.use_history:
+                    self.history.set(messages)
+
+                self._log_chat_finished(model=model)
+
+                if self.context.tracing_enabled:
+                    span.set_attribute(GEN_AI_USAGE_INPUT_TOKENS, total_input_tokens)
+                    span.set_attribute(GEN_AI_USAGE_OUTPUT_TOKENS, total_output_tokens)
+                    span.set_attribute(GEN_AI_RESPONSE_FINISH_REASONS, finish_reasons)
+
+                    for i, response in enumerate(responses):
+                        response_data = (
+                            self.extract_response_message_attributes_for_tracing(
+                                response, prefix=f"response.{i}"
+                            )
+                        )
+                        span.set_attributes(response_data)
+
+                # Yield completion event
+                yield StreamEvent(
+                    type=StreamEventType.COMPLETE,
+                    model=model,
+                    usage={
+                        "input_tokens": total_input_tokens,
+                        "output_tokens": total_output_tokens,
+                    },
+                    metadata={
+                        "finish_reasons": finish_reasons,
+                        "iterations": len(responses),
+                    },
+                )
+
+            except Exception as e:
+                # Yield error event
+                self.logger.error(f"Error during streaming generation: {e}")
+                span.record_exception(e)
+                span.set_status(trace.Status(trace.StatusCode.ERROR))
+
+                yield StreamEvent(
+                    type=StreamEventType.ERROR,
+                    content={"error": str(e), "type": type(e).__name__},
+                    metadata={"exception": str(e)},
+                )
 
     async def generate_str(
         self,

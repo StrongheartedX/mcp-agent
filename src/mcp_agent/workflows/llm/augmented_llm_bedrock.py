@@ -1,6 +1,7 @@
 import asyncio
 import functools
-from typing import TYPE_CHECKING, Type
+import json
+from typing import TYPE_CHECKING, AsyncIterator, Type
 from boto3 import Session
 
 from pydantic import BaseModel
@@ -27,6 +28,7 @@ from mcp_agent.workflows.llm.augmented_llm import (
     ProviderToMCPConverter,
     RequestParams,
 )
+from mcp_agent.workflows.llm.streaming_events import StreamEvent, StreamEventType
 from mcp_agent.logging.logger import get_logger
 from mcp_agent.workflows.llm.multipart_converter_bedrock import BedrockConverter
 from mcp_agent.tracing.token_tracking_decorator import track_tokens
@@ -263,6 +265,364 @@ class BedrockAugmentedLLM(AugmentedLLM[MessageUnionTypeDef, MessageUnionTypeDef]
         self._log_chat_finished(model=model)
 
         return responses
+
+    @staticmethod
+    def _parse_tool_input(tool_input):
+        """Parse tool input from JSON string to dict if needed.
+
+        Bedrock streams tool input as a JSON string that needs parsing.
+        Falls back to the original value if parsing fails.
+        """
+        if isinstance(tool_input, str):
+            try:
+                return json.loads(tool_input)
+            except json.JSONDecodeError:
+                return tool_input
+        return tool_input
+
+    @track_tokens()
+    async def generate_stream(
+        self,
+        message,
+        request_params: RequestParams | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """
+        Stream LLM generation events using Bedrock's native streaming API.
+
+        This method provides real-time updates during generation, including:
+        - Text deltas as they're generated
+        - Tool use events and execution
+        - Iteration boundaries
+        - Token usage per iteration
+        """
+        try:
+            config = self.context.config
+            messages: list[MessageUnionTypeDef] = []
+            params = self.get_request_params(request_params)
+
+            if params.use_history:
+                messages.extend(self.history.get())
+
+            messages.extend(BedrockConverter.convert_mixed_messages_to_bedrock(message))
+
+            async def update_tools():
+                response = await self.agent.list_tools(tool_filter=params.tool_filter)
+                tool_config: ToolConfigurationTypeDef = {
+                    "tools": [
+                        {
+                            "toolSpec": {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "inputSchema": {"json": tool.inputSchema},
+                            }
+                        }
+                        for tool in response.tools
+                    ],
+                    "toolChoice": {"auto": {}},
+                }
+                return tool_config
+            tool_config = await update_tools()
+
+            responses: list[MessageUnionTypeDef] = []
+            model = await self.select_model(params)
+            last_stop_reason = None
+
+            # Track total token usage across all iterations
+            total_input_tokens = 0
+            total_output_tokens = 0
+
+            for i in range(params.max_iterations):
+                # Yield iteration start event
+                yield StreamEvent(
+                    type=StreamEventType.ITERATION_START,
+                    iteration=i,
+                    model=model,
+                    metadata={"messages_count": len(messages)},
+                )
+
+                # Final iteration check: If we're on the last iteration and the previous
+                # response was a tool call, inject a prompt to force a final answer.
+                # This must happen BEFORE the API call (can't check after - we'd be past max).
+                if (
+                    i == params.max_iterations - 1
+                    and responses
+                    and last_stop_reason == "tool_use"
+                ):
+                    final_prompt_message: MessageUnionTypeDef = {
+                        "role": "user",
+                        "content": [
+                            {
+                                "text": """We've reached the maximum number of iterations.
+                                Please stop using tools now and provide your final comprehensive answer based on all tool results so far.
+                                At the beginning of your response, clearly indicate that your answer may be incomplete due to reaching the maximum number of tool usage iterations,
+                                and explain what additional information you would have needed to provide a more complete answer."""
+                            }
+                        ],
+                    }
+                    messages.append(final_prompt_message)
+
+                # Build inference config
+                inference_config = {
+                    "maxTokens": params.maxTokens,
+                    "temperature": params.temperature,
+                    "stopSequences": params.stopSequences or [],
+                }
+
+                # Build system content
+                system_content = [
+                    {
+                        "text": self.instruction or params.systemPrompt,
+                    }
+                ]
+
+                # Build request arguments
+                arguments: ConverseRequestTypeDef = {
+                    "modelId": model,
+                    "messages": messages,
+                    "system": system_content,
+                    "inferenceConfig": inference_config,
+                }
+
+                if tool_config["tools"]:
+                    arguments["toolConfig"] = tool_config
+
+                self.logger.debug("Streaming request arguments:", data=arguments)
+                self._log_chat_progress(chat_turn=(len(messages) + 1) // 2, model=model)
+
+                # Create Bedrock client
+                bedrock_config = config.bedrock if config.bedrock else BedrockSettings()
+                session = Session(profile_name=bedrock_config.profile)
+                bedrock_client = session.client(
+                    "bedrock-runtime",
+                    aws_access_key_id=bedrock_config.aws_access_key_id,
+                    aws_secret_access_key=bedrock_config.aws_secret_access_key,
+                    aws_session_token=bedrock_config.aws_session_token,
+                    region_name=bedrock_config.aws_region,
+                )
+
+                # Use native streaming API (run in executor since boto3 is synchronous)
+                loop = asyncio.get_running_loop()
+                stream_response = await loop.run_in_executor(
+                    None, functools.partial(bedrock_client.converse_stream, **arguments)
+                )
+
+                # Process streaming events and build final message
+                stop_reason = None
+                response_content: list[ContentBlockUnionTypeDef] = []
+                current_text_block = ""
+                current_tool_use_block = None
+                usage_data = {}
+
+                for event in stream_response["stream"]:
+                    # Handle content block start
+                    if "contentBlockStart" in event:
+                        block_start = event["contentBlockStart"]
+                        if "toolUse" in block_start.get("start", {}):
+                            current_tool_use_block = block_start["start"]["toolUse"]
+
+                    # Handle text deltas
+                    elif "contentBlockDelta" in event:
+                        delta = event["contentBlockDelta"]["delta"]
+                        if "text" in delta:
+                            text_delta = delta["text"]
+                            current_text_block += text_delta
+                            yield StreamEvent(
+                                type=StreamEventType.TEXT_DELTA,
+                                content=text_delta,
+                                iteration=i,
+                                model=model,
+                            )
+                        elif "toolUse" in delta:
+                            # Accumulate tool use input
+                            if current_tool_use_block:
+                                if "input" not in current_tool_use_block:
+                                    current_tool_use_block["input"] = ""
+                                current_tool_use_block["input"] += delta["toolUse"].get(
+                                    "input", ""
+                                )
+
+                    # Handle content block stop
+                    elif "contentBlockStop" in event:
+                        # Finalize current block
+                        if current_text_block:
+                            response_content.append({"text": current_text_block})
+                            current_text_block = ""
+                        elif current_tool_use_block:
+                            # Parse tool input JSON string to dict for message history
+                            current_tool_use_block["input"] = self._parse_tool_input(
+                                current_tool_use_block.get("input")
+                            )
+                            response_content.append({"toolUse": current_tool_use_block})
+                            current_tool_use_block = None
+
+                    # Handle message stop
+                    elif "messageStop" in event:
+                        stop_reason = event["messageStop"]["stopReason"]
+                        last_stop_reason = stop_reason
+                        # Don't break - continue to receive metadata event
+
+                    # Handle metadata event for usage
+                    elif "metadata" in event:
+                        usage_data = event["metadata"].get("usage", {})
+                        break  # Now we can break after receiving usage
+
+                # Get usage from captured metadata event
+                usage = usage_data
+                iteration_input = usage.get("inputTokens", 0)
+                iteration_output = usage.get("outputTokens", 0)
+
+                # Build response message
+                response_message: MessageUnionTypeDef = {
+                    "role": "assistant",
+                    "content": response_content,
+                }
+
+                self.logger.debug(f"{model} response:", data=response_message)
+
+                # Add response to messages
+                messages.append(response_message)
+                responses.append(response_message)
+
+                # Accumulate total token usage
+                total_input_tokens += iteration_input
+                total_output_tokens += iteration_output
+
+                # Token tracking
+                if self.context.token_counter:
+                    await self.context.token_counter.record_usage(
+                        input_tokens=iteration_input,
+                        output_tokens=iteration_output,
+                        model_name=model,
+                        provider=self.provider,
+                    )
+
+                # Yield iteration end event with usage
+                yield StreamEvent(
+                    type=StreamEventType.ITERATION_END,
+                    iteration=i,
+                    model=model,
+                    stop_reason=stop_reason,
+                    usage={
+                        "input_tokens": iteration_input,
+                        "output_tokens": iteration_output,
+                    },
+                )
+
+                # Handle stop reasons
+                if stop_reason in ["end_turn", "stop_sequence", "max_tokens"]:
+                    self.logger.debug(
+                        f"Iteration {i}: Stopping because stopReason is '{stop_reason}'"
+                    )
+                    break
+                elif stop_reason == "tool_use":
+                    # Process tool calls
+                    for content in response_message["content"]:
+                        if content.get("toolUse"):
+                            tool_use_block = content["toolUse"]
+                            tool_name = tool_use_block["name"]
+                            tool_args_raw = tool_use_block["input"]
+                            tool_use_id = tool_use_block["toolUseId"]
+
+                            # Parse tool args if it's a JSON string
+                            tool_args = self._parse_tool_input(tool_args_raw)
+
+                            # Yield tool use start event
+                            yield StreamEvent(
+                                type=StreamEventType.TOOL_USE_START,
+                                content={
+                                    "name": tool_name,
+                                    "input": tool_args,
+                                },
+                                iteration=i,
+                                model=model,
+                                metadata={"tool_id": tool_use_id},
+                            )
+
+                            # Execute tool
+                            tool_call_request = CallToolRequest(
+                                method="tools/call",
+                                params=CallToolRequestParams(
+                                    name=tool_name, arguments=tool_args
+                                ),
+                            )
+
+                            result = await self.call_tool(
+                                request=tool_call_request, tool_call_id=tool_use_id
+                            )
+
+                            # Yield tool result event
+                            yield StreamEvent(
+                                type=StreamEventType.TOOL_RESULT,
+                                content={
+                                    "result": str(result.content),
+                                    "is_error": result.isError,
+                                },
+                                iteration=i,
+                                model=model,
+                                metadata={"tool_id": tool_use_id},
+                            )
+
+                            # Add tool result to messages
+                            tool_result_message: MessageUnionTypeDef = {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "toolResult": {
+                                            "content": mcp_content_to_bedrock_content(
+                                                result.content
+                                            ),
+                                            "toolUseId": tool_use_id,
+                                            "status": "error"
+                                            if result.isError
+                                            else "success",
+                                        }
+                                    }
+                                ],
+                            }
+                            messages.append(tool_result_message)
+
+                            # Yield tool use end event
+                            yield StreamEvent(
+                                type=StreamEventType.TOOL_USE_END,
+                                iteration=i,
+                                model=model,
+                                metadata={"tool_id": tool_use_id},
+                            )
+
+                    # Refresh tools to pick up any newly available tools enabled by previous execution
+                    tool_config = await update_tools()
+
+            # Update history
+            if params.use_history:
+                self.history.set(messages)
+
+            self._log_chat_finished(model=model)
+
+            # Note: Tracing attributes are set by the @track_tokens() decorator
+            # Unlike Anthropic's implementation, Bedrock doesn't manually manage spans here
+
+            # Yield completion event with total usage
+            yield StreamEvent(
+                type=StreamEventType.COMPLETE,
+                model=model,
+                usage={
+                    "input_tokens": total_input_tokens,
+                    "output_tokens": total_output_tokens,
+                },
+                metadata={
+                    "iterations": len(responses),
+                },
+            )
+
+        except Exception as e:
+            # Yield error event
+            self.logger.error(f"Error during streaming generation: {e}")
+
+            yield StreamEvent(
+                type=StreamEventType.ERROR,
+                content={"error": str(e), "type": type(e).__name__},
+                metadata={"exception": str(e)},
+            )
 
     async def generate_str(
         self,

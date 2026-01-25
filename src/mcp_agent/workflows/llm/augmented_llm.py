@@ -2,6 +2,7 @@ from abc import abstractmethod
 
 from typing import (
     Any,
+    AsyncIterator,
     Dict,
     Generic,
     List,
@@ -50,6 +51,7 @@ from mcp_agent.tracing.telemetry import (
     record_attributes,
 )
 from mcp_agent.workflows.llm.llm_selector import ModelSelector
+from mcp_agent.workflows.llm.streaming_events import StreamEvent, StreamEventType
 
 if TYPE_CHECKING:
     from mcp_agent.core.context import Context
@@ -230,6 +232,20 @@ class AugmentedLLMProtocol(Protocol, Generic[MessageParamT, MessageT]):
     ) -> ModelT:
         """Request a structured LLM generation and return the result as a Pydantic model."""
 
+    async def generate_stream(
+        self,
+        message: MessageTypes,
+        request_params: RequestParams | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream LLM generation events as they occur."""
+
+    async def generate_str_stream(
+        self,
+        message: MessageTypes,
+        request_params: RequestParams | None = None,
+    ) -> AsyncIterator[str]:
+        """Stream only text deltas (convenience method)."""
+
 
 class ProviderToMCPConverter(Protocol, Generic[MessageParamT, MessageT]):
     """Conversions between LLM provider and MCP types"""
@@ -265,7 +281,6 @@ class AugmentedLLM(ContextDependent, AugmentedLLMProtocol[MessageParamT, Message
     selecting appropriate tools, and determining what information to retain.
     """
 
-    # TODO: saqadri - add streaming support (e.g. generate_stream)
     # TODO: saqadri - consider adding middleware patterns for pre/post processing of messages, for now we have pre/post_tool_call
 
     provider: str | None = None
@@ -362,6 +377,64 @@ class AugmentedLLM(ContextDependent, AugmentedLLMProtocol[MessageParamT, Message
         request_params: RequestParams | None = None,
     ) -> ModelT:
         """Request a structured LLM generation and return the result as a Pydantic model."""
+
+    @abstractmethod
+    async def generate_stream(
+        self,
+        message: MessageTypes,
+        request_params: RequestParams | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """
+        Stream LLM generation events as they occur.
+
+        This method provides real-time streaming of:
+        - Text deltas as they're generated
+        - Tool use start/end events
+        - Tool execution results
+        - Iteration boundaries
+        - Final completion
+
+        Args:
+            message: Input message(s) to process
+            request_params: Optional request configuration
+
+        Yields:
+            StreamEvent objects as generation progresses
+
+        Example:
+            async for event in llm.generate_stream("What's the weather?"):
+                if event.type == StreamEventType.TEXT_DELTA:
+                    print(event.content, end="", flush=True)
+                elif event.type == StreamEventType.TOOL_USE_START:
+                    print(f"\\n[Calling {event.content['name']}]")
+        """
+        raise NotImplementedError("Streaming not implemented for this provider")
+
+    async def generate_str_stream(
+        self,
+        message: MessageTypes,
+        request_params: RequestParams | None = None,
+    ) -> AsyncIterator[str]:
+        """
+        Stream only text deltas (convenience method).
+
+        This is a convenience wrapper around generate_stream() that yields only
+        text content, filtering out other event types.
+
+        Args:
+            message: Input message(s) to process
+            request_params: Optional request configuration
+
+        Yields:
+            Text strings as they're generated
+
+        Example:
+            async for text in llm.generate_str_stream("Tell me a story"):
+                print(text, end="", flush=True)
+        """
+        async for event in self.generate_stream(message, request_params):
+            if event.type == StreamEventType.TEXT_DELTA:
+                yield event.content
 
     # Provider configuration access
     @classmethod
